@@ -34,6 +34,40 @@ def accuracy_at_k(predictions, ground_truth, k=10):
     
     return hits / ground_truth.size(0)
 
+def ndcg_at_k(predictions, ground_truth, k=10):
+    """
+    Calculate nDCG@K (Normalized Discounted Cumulative Gain).
+    Assumes single ground truth per user (IDCG=1).
+    predictions: [batch_size, num_pois]
+    ground_truth: [batch_size]
+    """
+    # Get top k indices: [batch_size, k]
+    _, topk_indices = torch.topk(predictions, k, dim=1)
+    
+    # ground_truth: [batch_size, 1]
+    ground_truth_expanded = ground_truth.unsqueeze(1)
+    
+    # [batch_size, k] boolean mask
+    hits = (topk_indices == ground_truth_expanded)
+    
+    # nonzero returns [hit_index, col_index] where col_index is rank (0-based)
+    hits_indices = hits.nonzero(as_tuple=False)
+    
+    if hits_indices.size(0) == 0:
+        return 0.0
+        
+    # col_index is the 0-based rank in the top-k list
+    ranks = hits_indices[:, 1].float()
+    
+    # DCG = sum(1 / log2(rank + 1)) where rank is 1-based
+    # So here rank (1-based) = ranks (0-based) + 1
+    # denominator = log2((ranks + 1) + 1) = log2(ranks + 2)
+    # Since IDCG=1 for single target, nDCG = DCG
+    
+    scores = 1.0 / torch.log2(ranks + 2.0)
+    
+    return scores.sum().item() / ground_truth.size(0)
+
 def mrr(predictions, ground_truth):
     """
     Calculate Mean Reciprocal Rank (MRR).
