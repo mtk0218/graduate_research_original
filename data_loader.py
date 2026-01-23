@@ -16,14 +16,20 @@ class CheckinDataset(Dataset):
        
     2. Recommendation Training (Trajectory, Time, Weather, Target)
     """
-    def __init__(self, user_trajectories, seq_len=20, num_pois=None):
+    def __init__(self, user_trajectories, seq_len=20, num_pois=None, usage='train'):
         """
         user_trajectories: dict {user_id: list of (poi_id, time_idx, weather_idx, lat, lon)}
         seq_len: max sequence length
+        usage: 'train', 'validation', or 'test'
+               - train: targets are [2, ..., m-2]
+               - validation: target is m-1
+               - test: target is m
+               (where m is length, 1-based in paper, so indices are adjusted)
         """
         self.user_trajectories = user_trajectories
         self.seq_len = seq_len
         self.num_pois = num_pois
+        self.usage = usage
         
         self.data_samples = []
         self._process_trajectories()
@@ -36,21 +42,45 @@ class CheckinDataset(Dataset):
         """
         for user_id, traj in self.user_trajectories.items():
             # traj is list of tuples
-            if len(traj) < 2:
+            L = len(traj)
+            if L < 2:
                 continue
             
-            # Simple approach: input=[0...t-1], target=t
-            # Sliding window if trajectory is long
+            # Indices: 0 to L-1
+            # Paper: m checkins.
+            # Train: Input [1, m-3] -> Target [2, m-2].
+            #        Indices: Targets from 1 to L-3. (Input ends at Target-1)
+            # Validation: Target m-1 -> Index L-2.
+            # Test: Target m -> Index L-1
             
-            # We treat the entire history up to t-1 as input (truncated to seq_len)
-            for i in range(1, len(traj)):
+            target_indices = []
+            if self.usage == 'train':
+                # Targets: 1 to L-3 (inclusive)
+                # If L=4, range(1, 2) -> [1]. Correct.
+                # If L=3, range(1, 1) -> []. Correct.
+                target_indices = range(1, L - 2)
+            elif self.usage == 'validation':
+                # Target: L-2
+                # If L=3, target 1. Input [0]. OK.
+                # If L=2, target 0. Input []. Invalid (need context).
+                if L >= 3:
+                     target_indices = [L - 2]
+            elif self.usage == 'test':
+                # Target: L-1
+                # If L=2, target 1. Input [0]. OK.
+                if L >= 2:
+                    target_indices = [L - 1]
+            
+            for i in target_indices:
                 target = traj[i]
                 
                 start_idx = max(0, i - self.seq_len)
                 input_seq = traj[start_idx:i]
                 
-                if len(input_seq) > self.seq_len:
-                    pass # Should be handled by seq_len constraint in loop
+                # Double check input is not empty
+                if len(input_seq) == 0:
+                    continue
+
 
                 self.data_samples.append({
                     'user_id': user_id,
