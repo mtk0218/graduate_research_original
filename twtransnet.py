@@ -4,11 +4,12 @@ import torch.nn.functional as F
 from .model_components import TransLayer, UserGraphLayer, SpatialTemporalSelfAttention
 
 class TWTransNet(nn.Module):
-    def __init__(self, num_users, num_pois, embed_dim, num_times, num_now_weathers, num_day_weathers, num_month_weathers, dropout=0.1):
+    def __init__(self, num_users, num_pois, embed_dim, num_times, num_now_weathers, num_day_weathers, num_month_weathers, dropout, gamma):
         super(TWTransNet, self).__init__()
         self.num_users = num_users
         self.num_pois = num_pois
         self.embed_dim = embed_dim
+        self.gamma = gamma
 
         # 1. Embeddings
         self.user_embedding = nn.Embedding(num_users, embed_dim)
@@ -185,8 +186,7 @@ class TWTransNet(nn.Module):
         pos_dist = self.trans_layer(h, relation_emb, None, t)
         neg_dist = self.trans_layer(h, relation_emb, None, n_t)
         
-        gamma = 1.0 # Margin, hyperparameter
-        loss = torch.relu(pos_dist + gamma - neg_dist)
+        loss = torch.relu(pos_dist + self.gamma - neg_dist)
         return loss.mean()
 
     def enhance_poi_rep(self, traj_emb):
