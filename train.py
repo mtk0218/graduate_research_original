@@ -5,10 +5,11 @@ from torch.utils.data import DataLoader, random_split
 import numpy as np
 from TWTransNet.twtransnet import TWTransNet
 from TWTransNet.data_loader import CheckinDataset
-from TWTransNet.utils import accuracy_at_k, mrr
+from TWTransNet.utils import accuracy_at_k, mrr, ndcg_at_k
 from graph_utils import build_interaction_graph
 from datetime import datetime, timedelta
 import sys
+import os
 
 
 # Global weather list to ensure consistency across functions
@@ -128,7 +129,7 @@ def load_real_data(): #新たに作成
     return len(data), len(POI_list) + 1, data, poi_coords
 
 
-def train_epoch(model, dataloader, optimizer, num_pois, edges, poi_coords, device='cpu'):
+def train_epoch(model, dataloader, optimizer, num_pois, edges, poi_coords, lambda_weight=0.1, device='cpu'):
     model.train()
     total_loss = 0
     total_rec_loss = 0
@@ -137,6 +138,7 @@ def train_epoch(model, dataloader, optimizer, num_pois, edges, poi_coords, devic
     total_acc5 = 0
     total_acc10 = 0
     total_mrr = 0
+    total_ndcg10 = 0
     
     criterion_rec = nn.CrossEntropyLoss()
     
@@ -254,7 +256,7 @@ def train_epoch(model, dataloader, optimizer, num_pois, edges, poi_coords, devic
                                                  s_emb_all=refined_s, d_emb_all=refined_day, m_emb_all=refined_month)
         
         # Total Loss
-        loss = rec_loss + 0.1 * trans_loss # lambda=0.1
+        loss = rec_loss + lambda_weight * trans_loss # lambda defined by param
         
         loss.backward()
         optimizer.step()
@@ -269,6 +271,7 @@ def train_epoch(model, dataloader, optimizer, num_pois, edges, poi_coords, devic
         acc5 = accuracy_at_k(scores, target_idx, k=5)
         acc10 = accuracy_at_k(scores, target_idx, k=10)
         mrr_val = mrr(scores, target_idx)
+        ndcg10_val = ndcg_at_k(scores, target_idx, k=10)
         
         total_loss += loss.item()
         total_rec_loss += rec_loss.item()
@@ -277,17 +280,22 @@ def train_epoch(model, dataloader, optimizer, num_pois, edges, poi_coords, devic
         total_acc5 += acc5
         total_acc10 += acc10
         total_mrr += mrr_val
+        total_ndcg10 += ndcg10_val
         
     num_batches = len(dataloader)
+    if num_batches == 0:
+        return 0, 0, 0, 0, 0, 0, 0, 0
+
     return (total_loss / num_batches, 
             total_rec_loss / num_batches, 
             total_trans_loss / num_batches,
             total_acc1 / num_batches,
             total_acc5 / num_batches,
             total_acc10 / num_batches,
-            total_mrr / num_batches)
+            total_mrr / num_batches,
+            total_ndcg10 / num_batches)
 
-def evaluate(model, dataloader, num_pois, edges, poi_coords, device='cpu'):
+def evaluate(model, dataloader, num_pois, edges, poi_coords, lambda_weight=0.1, device='cpu'):
     model.eval()
     total_loss = 0
     total_rec_loss = 0
@@ -296,6 +304,7 @@ def evaluate(model, dataloader, num_pois, edges, poi_coords, device='cpu'):
     total_acc5 = 0
     total_acc10 = 0
     total_mrr = 0
+    total_ndcg10 = 0
     
     criterion_rec = nn.CrossEntropyLoss()
     
@@ -369,13 +378,14 @@ def evaluate(model, dataloader, num_pois, edges, poi_coords, device='cpu'):
                                                      t_emb_all=refined_t, w_emb_all=refined_w,
                                                      s_emb_all=refined_s, d_emb_all=refined_day, m_emb_all=refined_month)
             
-            loss = rec_loss + 0.1 * trans_loss
+            loss = rec_loss + lambda_weight * trans_loss # lambda defined by param
             
             # Metrics
             acc1 = accuracy_at_k(scores, target_idx, k=1)
             acc5 = accuracy_at_k(scores, target_idx, k=5)
             acc10 = accuracy_at_k(scores, target_idx, k=10)
             mrr_val = mrr(scores, target_idx)
+            ndcg10_val = ndcg_at_k(scores, target_idx, k=10)
             
             total_loss += loss.item()
             total_rec_loss += rec_loss.item()
@@ -384,10 +394,11 @@ def evaluate(model, dataloader, num_pois, edges, poi_coords, device='cpu'):
             total_acc5 += acc5
             total_acc10 += acc10
             total_mrr += mrr_val
+            total_ndcg10 += ndcg10_val
             
     num_batches = len(dataloader)
     if num_batches == 0:
-        return 0, 0, 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, 0, 0, 0
         
     return (total_loss / num_batches, 
             total_rec_loss / num_batches, 
@@ -395,18 +406,22 @@ def evaluate(model, dataloader, num_pois, edges, poi_coords, device='cpu'):
             total_acc1 / num_batches,
             total_acc5 / num_batches,
             total_acc10 / num_batches,
-            total_mrr / num_batches)
+            total_mrr / num_batches,
+            total_ndcg10 / num_batches)
 
 def main():
-    # Parameters
-    NUM_USERS = 50
-    NUM_POIS = 200
-    EMBED_DIM = 32
-    SEQ_LEN = 10
-    BATCH_SIZE = 16
-    EPOCHS = 100
-    MODE = 1 # 0: mock data, 1: real data
     TIME_SLOT = 24
+    # Hyperparameters Config
+    Config = {
+        'EMBED_DIM': 32,
+        'SEQ_LEN': 10,
+        'BATCH_SIZE': 16,
+        'EPOCHS': 100,
+        'LR': 0.001,
+        'LAMBDA_WEIGHT': 0.1, # Weight for Translation Loss
+        'GAMMA': 1.0,         # Margin for Translation Loss
+        'DROPOUT': 0.1,
+    }
     
     # デバイスの自動検出
     if torch.cuda.is_available():
@@ -419,28 +434,25 @@ def main():
         device = torch.device('cpu')
         print("Using CPU")
     
-    if MODE == 0:
-        print("Generating Mock Data...")
-        raw_data, poi_coords = generate_mock_data(NUM_USERS, NUM_POIS)
-    elif MODE == 1:    # 1. Load Data
-        print("Loading Real Data...")
-        num_data, num_pois, raw_data, poi_coords = load_real_data()
-        # Note: NUM_POIS includes padding index 0. Actual POIs are 1..NUM_POIS-1
-        NUM_USERS = num_data # Update NUM_USERS based on real data
-        NUM_POIS = num_pois
+
+    # 1. Load Real Data
+    print("Loading Real Data...")
+    num_users, num_pois, raw_data, poi_coords = load_real_data()
+    # Note: NUM_POIS includes padding index 0. Actual POIs are 1..NUM_POIS-1
+    print(f"Loaded Data: Users={num_users}, POIs={num_pois}")
 
     # 2. Setup Dataset & DataLoader
-    dataset = CheckinDataset(raw_data, seq_len=SEQ_LEN, num_pois=NUM_POIS)
+    # Create 3 separate datasets based on the usage mode
+    train_dataset = CheckinDataset(raw_data, seq_len=Config['SEQ_LEN'], num_pois=num_pois, usage='train')
+    val_dataset = CheckinDataset(raw_data, seq_len=Config['SEQ_LEN'], num_pois=num_pois, usage='validation')
+    test_dataset = CheckinDataset(raw_data, seq_len=Config['SEQ_LEN'], num_pois=num_pois, usage='test')
+
+    train_loader = DataLoader(train_dataset, batch_size=Config['BATCH_SIZE'], shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=Config['BATCH_SIZE'], shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=Config['BATCH_SIZE'], shuffle=False)
     
-    # Split Dataset 9:1
-    train_size = int(0.9 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    print(f"Dataset Split: Train={len(train_dataset)}, Test={len(test_dataset)}")
+    print(f"Dataset Split: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
+    print(f"Hyperparams: Embed={Config['EMBED_DIM']}, Gamma={Config['GAMMA']}, Lambda={Config['LAMBDA_WEIGHT']}")
     
     # 3. Model
     print("Initializing Model...")
@@ -451,34 +463,55 @@ def main():
     print(f"Num Now Weathers: {num_now_weathers}, Num Day Weathers: {num_day_weathers}, Num Month Weathers: {num_month_weathers}")
     
     # Assuming num_categories=10 for mock data, or 10 if we add real category parsing later.
-    model = TWTransNet(NUM_USERS, NUM_POIS, EMBED_DIM, TIME_SLOT, num_now_weathers, num_day_weathers, num_month_weathers)
+    model = TWTransNet(num_users, num_pois, Config['EMBED_DIM'], TIME_SLOT, num_now_weathers, num_day_weathers, num_month_weathers, Config['DROPOUT'], Config['GAMMA'])
     model = model.to(device)  # モデルをGPUに転送
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=Config['LR'])
     
     print("Starting Training...")
     
     # Build Interaction Graph (Edges) - デバイスを指定
     edges = build_interaction_graph(raw_data, device=device)
+
+    best_val_mrr = -1
+    best_val_ndcg10 = -1
+    best_model_state = None
     
-    for epoch in range(EPOCHS):
+    for epoch in range(Config['EPOCHS']):
 
         # Train
-        loss, rec_l, trans_l, acc1, acc5, acc10, mrr_val = train_epoch(model, train_loader, optimizer, NUM_POIS, edges, poi_coords, device=device)
-        print(f"Epoch {epoch+1}/{EPOCHS} [Train] | Loss: {loss:.4f} | Rec: {rec_l:.4f} | Trans: {trans_l:.4f} "
-              f"| Acc@1: {acc1:.4f} | Acc@5: {acc5:.4f} | Acc@10: {acc10:.4f} | MRR: {mrr_val:.4f}")
+        loss, rec_l, trans_l, acc1, acc5, acc10, mrr_val, ndcg10 = train_epoch(model, train_loader, optimizer, num_pois, 
+                                                                       edges, poi_coords, lambda_weight=Config['LAMBDA_WEIGHT'], device=device)
+        print(f"Epoch {epoch+1}/{Config['EPOCHS']} [Train] | Loss: {loss:.4f} | Rec: {rec_l:.4f} | Trans: {trans_l:.4f} "
+              f"| Acc@1: {acc1:.4f} | Acc@5: {acc5:.4f} | Acc@10: {acc10:.4f} | MRR: {mrr_val:.4f} | nDCG@10: {ndcg10:.4f}")
         
-        # Test
-        t_loss, t_rec_l, t_trans_l, t_acc1, t_acc5, t_acc10, t_mrr_val = evaluate(model, test_loader, NUM_POIS, edges, poi_coords, device=device)
-        print(f"Epoch {epoch+1}/{EPOCHS} [Test ] | Loss: {t_loss:.4f} | Rec: {t_rec_l:.4f} | Trans: {t_trans_l:.4f} "
-              f"| Acc@1: {t_acc1:.4f} | Acc@5: {t_acc5:.4f} | Acc@10: {t_acc10:.4f} | MRR: {t_mrr_val:.4f}")
+        # Validation
+        v_loss, v_rec_l, v_trans_l, v_acc1, v_acc5, v_acc10, v_mrr_val, v_ndcg10 = evaluate(model, val_loader, num_pois, 
+                                                                                  edges, poi_coords, lambda_weight=Config['LAMBDA_WEIGHT'], device=device)
+        print(f"Epoch {epoch+1}/{Config['EPOCHS']} [Valid] | Loss: {v_loss:.4f} | Rec: {v_rec_l:.4f} | Trans: {v_trans_l:.4f} "
+              f"| Acc@1: {v_acc1:.4f} | Acc@5: {v_acc5:.4f} | Acc@10: {v_acc10:.4f} | MRR: {v_mrr_val:.4f} | nDCG@10: {v_ndcg10:.4f}")
+        
+        # Save Best Model based on Validation nDCG
+        if v_ndcg10 > best_val_ndcg10:
+            best_val_ndcg10 = v_ndcg10
+            best_model_state = model.state_dict()
+            print(f"  >>> Best Valid nDCG@10 updated: {best_val_ndcg10:.4f}")
+        else:
+            print(f"  >>> Best Valid nDCG@10 not updated: {best_val_ndcg10:.4f}")
 
     print("Training Finished.")
 
     
-    # Save Model
-    # torch.save(model.state_dict(), "twtransnet_model.pth")
-    # print("Model saved.")
+    # Final Test with Best Model
+    print("Loading Best Model for Testing...")
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+    
+    t_loss, t_rec_l, t_trans_l, t_acc1, t_acc5, t_acc10, t_mrr_val, t_ndcg10 = evaluate(model, test_loader, num_pois, 
+                                                                              edges, poi_coords, lambda_weight=Config['LAMBDA_WEIGHT'], device=device)
+    print(f"Final Test Result | Loss: {t_loss:.4f} | Rec: {t_rec_l:.4f} | Trans: {t_trans_l:.4f} "
+          f"| Acc@1: {t_acc1:.4f} | Acc@5: {t_acc5:.4f} | Acc@10: {t_acc10:.4f} | MRR: {t_mrr_val:.4f} | nDCG@10: {t_ndcg10:.4f}")
+    
 
 if __name__ == "__main__":
     main()
